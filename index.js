@@ -24,7 +24,7 @@
 
     function toast(text) {
         try {
-            vendetta.ui.toasts.showToast(text);
+            ReactNative.ToastAndroid.show(String(text), ReactNative.ToastAndroid.SHORT);
         } catch (e) {}
     }
 
