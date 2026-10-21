@@ -1,0 +1,8 @@
+{
+    "name": "KeywordMask",
+    "description": "自动遮罩收到消息里的关键词，点击显示（仅本地生效）",
+    "authors": [{ "name": "me", "id": "0" }],
+    "main": "index.js",
+    "hash": "",
+    "vendetta": {}
+}
