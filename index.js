@@ -3,7 +3,7 @@
 
     const { before } = vendetta.patcher;
     const { findByName, findByStoreName, findByProps } = vendetta.metro;
-    const { React, ReactNative } = vendetta.metro.common;
+    const { React, ReactNative, FluxDispatcher } = vendetta.metro.common;
     const { useProxy } = vendetta.storage;
     const { FormSection, FormInput, FormRow, FormSwitch, FormText } = vendetta.ui.components.Forms;
     const { ScrollView, Alert, View, Text, TouchableOpacity } = ReactNative;
@@ -74,6 +74,51 @@
         });
     }
 
+    // ---------- 让已显示的消息立刻生效 ----------
+    // 原理：对当前聊天里已加载的消息，用原文各发一次“消息更新”，
+    // 触发重新渲染，渲染时会按最新的关键词重新遮罩。
+    function refreshMessages() {
+        try {
+            const SelectedChannelStore = findByStoreName("SelectedChannelStore");
+            const MessageStore = findByStoreName("MessageStore");
+            const channelId = SelectedChannelStore.getChannelId();
+            if (!channelId) return false;
+
+            const collection = MessageStore.getMessages(channelId);
+            const list =
+                (collection && collection._array) ||
+                (collection && typeof collection.toArray === "function" ? collection.toArray() : []);
+            if (!list || !list.length) return false;
+
+            for (const msg of list) {
+                const content =
+                    msg.__kwmOrig !== undefined && msg.content === msg.__kwmOut ? msg.__kwmOrig : msg.content;
+                if (typeof content !== "string" || !content) continue;
+                FluxDispatcher.dispatch({
+                    type: "MESSAGE_UPDATE",
+                    message: {
+                        id: msg.id,
+                        channel_id: msg.channel_id || channelId,
+                        guild_id: msg.guild_id,
+                        content: content,
+                    },
+                });
+            }
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    let refreshTimer = null;
+    function scheduleRefresh() {
+        if (refreshTimer) clearTimeout(refreshTimer);
+        refreshTimer = setTimeout(() => {
+            refreshTimer = null;
+            refreshMessages();
+        }, 300);
+    }
+
     let unpatch;
 
     exports.onLoad = () => {
@@ -104,6 +149,7 @@
 
     exports.onUnload = () => {
         if (unpatch) unpatch();
+        if (refreshTimer) clearTimeout(refreshTimer);
     };
 
     // ---------- 按钮组件 ----------
@@ -152,6 +198,7 @@
             storage.list = [{ word: w, enabled: true }, ...storage.list];
             setDraft("");
             toast("已添加：" + w);
+            scheduleRefresh();
         };
 
         const q = query.trim().toLowerCase();
@@ -161,10 +208,12 @@
             const set = new Set(shown.map((i) => i.word));
             storage.list = storage.list.map((i) => (set.has(i.word) ? { word: i.word, enabled: v } : i));
             toast(v ? "已启用 " + shown.length + " 个" : "已停用 " + shown.length + " 个");
+            scheduleRefresh();
         };
 
         const toggle = (word, v) => {
             storage.list = storage.list.map((i) => (i.word === word ? { word: word, enabled: v } : i));
+            scheduleRefresh();
         };
 
         const remove = (word) => {
@@ -175,9 +224,14 @@
                     style: "destructive",
                     onPress: () => {
                         storage.list = storage.list.filter((i) => i.word !== word);
+                        scheduleRefresh();
                     },
                 },
             ]);
+        };
+
+        const applyNow = () => {
+            toast(refreshMessages() ? "已应用到当前聊天" : "没能刷新，请切换一次频道");
         };
 
         return h(
@@ -193,6 +247,7 @@
                         value: storage.enabled,
                         onValueChange: (v) => {
                             storage.enabled = v;
+                            scheduleRefresh();
                         },
                     }),
                 }),
@@ -202,9 +257,20 @@
                         value: storage.maskSelf,
                         onValueChange: (v) => {
                             storage.maskSelf = v;
+                            scheduleRefresh();
                         },
                     }),
-                })
+                }),
+                h(
+                    View,
+                    { style: { paddingHorizontal: 16, paddingVertical: 8 } },
+                    h(Btn, { text: "立即应用到当前聊天", kind: "secondary", onPress: applyNow })
+                ),
+                h(
+                    FormText,
+                    { style: { paddingHorizontal: 16, paddingBottom: 8 } },
+                    "修改关键词后会自动应用，没反应时可以点上面的按钮"
+                )
             ),
 
             h(
