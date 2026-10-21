@@ -2,11 +2,11 @@
     "use strict";
 
     const { before } = vendetta.patcher;
-    const { findByName } = vendetta.metro;
+    const { findByName, findByStoreName, findByProps } = vendetta.metro;
     const { React, ReactNative } = vendetta.metro.common;
     const { useProxy } = vendetta.storage;
     const { FormSection, FormInput, FormRow, FormSwitch, FormText } = vendetta.ui.components.Forms;
-    const { ScrollView, Alert } = ReactNative;
+    const { ScrollView, Alert, View, Text, TouchableOpacity } = ReactNative;
     const storage = vendetta.plugin.storage;
     const h = React.createElement;
 
@@ -20,11 +20,29 @@
             .map((w) => ({ word: w, enabled: true }));
     }
     if (typeof storage.enabled !== "boolean") storage.enabled = true;
+    if (typeof storage.maskSelf !== "boolean") storage.maskSelf = false;
 
     function toast(text) {
         try {
             vendetta.ui.toasts.showToast(text);
         } catch (e) {}
+    }
+
+    // ---------- 当前用户 ID（用来跳过自己的消息） ----------
+    let myId = null;
+    function getMyId() {
+        if (myId) return myId;
+        try {
+            const store = findByStoreName("UserStore");
+            const u = store && store.getCurrentUser && store.getCurrentUser();
+            if (u && u.id) return (myId = u.id);
+        } catch (e) {}
+        try {
+            const mod = findByProps("getCurrentUser");
+            const u = mod && mod.getCurrentUser && mod.getCurrentUser();
+            if (u && u.id) return (myId = u.id);
+        } catch (e) {}
+        return null;
     }
 
     // ---------- 遮罩逻辑 ----------
@@ -71,7 +89,10 @@
                 let orig = cur;
                 if (msg.__kwmOut !== undefined && cur === msg.__kwmOut) orig = msg.__kwmOrig;
 
-                const next = mask(orig);
+                // 自己发的消息：默认不遮罩，并把之前改过的还原
+                const mine = msg.author && getMyId() && msg.author.id === getMyId();
+                const next = mine && !storage.maskSelf ? orig : mask(orig);
+
                 msg.__kwmOrig = orig;
                 msg.__kwmOut = next;
                 if (next !== cur) msg.content = next;
@@ -85,11 +106,42 @@
         if (unpatch) unpatch();
     };
 
+    // ---------- 按钮组件 ----------
+    function Btn(props) {
+        const colors = { primary: "#5865F2", secondary: "#4E5058", danger: "#ED4245" };
+        const small = !!props.small;
+        return h(
+            TouchableOpacity,
+            {
+                onPress: props.onPress,
+                activeOpacity: 0.7,
+                style: Object.assign(
+                    {
+                        backgroundColor: colors[props.kind || "primary"],
+                        borderRadius: 8,
+                        paddingVertical: small ? 6 : 12,
+                        paddingHorizontal: small ? 12 : 16,
+                        alignItems: "center",
+                        justifyContent: "center",
+                    },
+                    props.style || {}
+                ),
+            },
+            h(
+                Text,
+                { style: { color: "#FFFFFF", fontWeight: "600", fontSize: small ? 13 : 15 } },
+                props.text
+            )
+        );
+    }
+
     // ---------- 设置页 ----------
     exports.settings = () => {
         useProxy(storage);
         const [draft, setDraft] = React.useState("");
         const [query, setQuery] = React.useState("");
+
+        const canAdd = draft.trim().length > 0;
 
         const add = () => {
             const w = draft.trim();
@@ -108,6 +160,7 @@
         const setShown = (v) => {
             const set = new Set(shown.map((i) => i.word));
             storage.list = storage.list.map((i) => (set.has(i.word) ? { word: i.word, enabled: v } : i));
+            toast(v ? "已启用 " + shown.length + " 个" : "已停用 " + shown.length + " 个");
         };
 
         const toggle = (word, v) => {
@@ -142,6 +195,15 @@
                             storage.enabled = v;
                         },
                     }),
+                }),
+                h(FormRow, {
+                    label: "也遮罩自己发的消息",
+                    trailing: h(FormSwitch, {
+                        value: storage.maskSelf,
+                        onValueChange: (v) => {
+                            storage.maskSelf = v;
+                        },
+                    }),
                 })
             ),
 
@@ -154,7 +216,15 @@
                     value: draft,
                     onChange: setDraft,
                 }),
-                h(FormRow, { label: "确认添加", onPress: add })
+                h(
+                    View,
+                    { style: { paddingHorizontal: 16, paddingVertical: 8 } },
+                    h(Btn, {
+                        text: canAdd ? "＋ 确认添加" : "先输入关键词",
+                        kind: canAdd ? "primary" : "secondary",
+                        onPress: add,
+                    })
+                )
             ),
 
             h(
@@ -166,22 +236,47 @@
                     value: query,
                     onChange: setQuery,
                 }),
-                h(FormRow, { label: "将下列全部启用", onPress: () => setShown(true) }),
-                h(FormRow, { label: "将下列全部停用", onPress: () => setShown(false) }),
+                h(
+                    View,
+                    { style: { flexDirection: "row", paddingHorizontal: 16, paddingVertical: 8 } },
+                    h(Btn, {
+                        text: "全部启用",
+                        kind: "primary",
+                        style: { flex: 1, marginRight: 8 },
+                        onPress: () => setShown(true),
+                    }),
+                    h(Btn, {
+                        text: "全部停用",
+                        kind: "secondary",
+                        style: { flex: 1 },
+                        onPress: () => setShown(false),
+                    })
+                ),
+                h(FormText, { style: { paddingHorizontal: 16, paddingBottom: 8 } }, "上面两个按钮只对当前筛选出的关键词生效"),
                 shown.length
                     ? shown.map((i) =>
                           h(FormRow, {
                               key: i.word,
                               label: i.word,
-                              subLabel: (i.enabled ? "已启用" : "已停用") + " · 点击此行可删除",
-                              onPress: () => remove(i.word),
-                              trailing: h(FormSwitch, {
-                                  value: i.enabled,
-                                  onValueChange: (v) => toggle(i.word, v),
-                              }),
+                              subLabel: i.enabled ? "已启用" : "已停用",
+                              trailing: h(
+                                  View,
+                                  { style: { flexDirection: "row", alignItems: "center" } },
+                                  h(Btn, {
+                                      text: "删除",
+                                      kind: "danger",
+                                      small: true,
+                                      style: { marginRight: 12 },
+                                      onPress: () => remove(i.word),
+                                  }),
+                                  h(FormSwitch, {
+                                      value: i.enabled,
+                                      onValueChange: (v) => toggle(i.word, v),
+                                  })
+                              ),
                           })
                       )
-                    : h(FormText, {}, q ? "没有匹配的关键词" : "还没有添加关键词")
+                    : h(FormText, { style: { paddingHorizontal: 16 } }, q ? "没有匹配的关键词" : "还没有添加关键词")
             )
         );
     };
