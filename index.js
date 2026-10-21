@@ -1,370 +1,215 @@
 (function (exports) {
     "use strict";
 
-    // Vendetta / Bunny 风格插件
-    // 不写入 MessageStore
-    // 不 dispatch MESSAGE_UPDATE
-    // 不直接修改原始消息内容
+    // 不调用 Toast 或 Alert
+    const api =
+        typeof vendetta !== "undefined"
+            ? vendetta
+            : null;
 
-    const { before } = vendetta.patcher;
-    const {
-        findByName,
-        findByStoreName,
-        findByProps
-    } = vendetta.metro;
+    if (
+        !api ||
+        !api.metro ||
+        !api.metro.common ||
+        !api.plugin ||
+        !api.patcher
+    ) {
+        exports.onLoad = () => {};
+        exports.onUnload = () => {};
+        exports.settings = () => null;
+        return exports;
+    }
 
-    const {
-        React,
-        ReactNative
-    } = vendetta.metro.common;
-
-    const { useProxy } = vendetta.storage;
-
-    const {
-        FormSection,
-        FormRow,
-        FormSwitch,
-        FormText
-    } = vendetta.ui.components.Forms;
+    const { React, ReactNative } = api.metro.common;
+    const { findByName, findByStoreName } = api.metro;
+    const { before } = api.patcher;
+    const store = api.plugin.storage;
 
     const {
         ScrollView,
-        Alert,
         View,
         Text,
         TextInput,
+        Switch,
         TouchableOpacity
     } = ReactNative;
 
-    const storage = vendetta.plugin.storage;
     const h = React.createElement;
 
-    // ========================================
-    // 初始化与旧版数据兼容
-    // ========================================
+    // ---------- 关键词数据 ----------
 
-    function cleanList(value) {
-        const incoming = Array.isArray(value)
-            ? value
-            : (
-                typeof storage.keywords === "string"
-                    ? storage.keywords.split(/[,，]/)
-                    : []
-            );
+    function normalize(items) {
+        const old = Array.isArray(items)
+            ? items
+            : typeof store.keywords === "string"
+                ? store.keywords.split(/[,，]/)
+                : [];
 
         const seen = new Set();
-        const result = [];
 
-        for (const item of incoming) {
+        return old.reduce((out, item) => {
             const word =
                 typeof item === "string"
                     ? item
                     : item && item.word;
 
-            if (typeof word !== "string") continue;
+            if (typeof word !== "string") return out;
 
             const w = word.trim();
 
-            if (!w || w.includes("||") || w.length > 100) {
-                continue;
+            if (
+                !w ||
+                w.length > 100 ||
+                w.includes("||") ||
+                seen.has(w.toLowerCase())
+            ) {
+                return out;
             }
 
-            const id = w.toLowerCase();
+            seen.add(w.toLowerCase());
 
-            if (seen.has(id)) continue;
-
-            seen.add(id);
-
-            result.push({
+            out.push({
                 word: w,
                 enabled:
-                    typeof item === "object"
-                        ? item.enabled !== false
-                        : true
+                    typeof item === "string" ||
+                    item.enabled !== false
             });
-        }
 
-        return result;
+            return out;
+        }, []);
     }
 
-    storage.list = cleanList(storage.list);
+    store.list = normalize(store.list);
 
-    if (typeof storage.enabled !== "boolean") {
-        storage.enabled = true;
+    if (typeof store.enabled !== "boolean") {
+        store.enabled = true;
     }
 
-    if (typeof storage.maskSelf !== "boolean") {
-        storage.maskSelf = false;
+    if (typeof store.maskSelf !== "boolean") {
+        store.maskSelf = false;
     }
 
-    // ========================================
-    // 通知
-    // ========================================
+    let unpatch = null;
+    let active = false;
+    let cachedSignature = null;
+    let cachedRegex = null;
 
-    function toast(message) {
-        try {
-            if (
-                ReactNative.Platform.OS === "android" &&
-                ReactNative.ToastAndroid
-            ) {
-                ReactNative.ToastAndroid.show(
-                    String(message),
-                    ReactNative.ToastAndroid.SHORT
-                );
-            }
-        } catch (_) {}
-    }
+    // ---------- 构造关键词正则 ----------
 
-    // ========================================
-    // 获取当前用户
-    // ========================================
-
-    let userStore;
-
-    function getMyId() {
-        try {
-            if (!userStore) {
-                userStore =
-                    findByStoreName("UserStore") ||
-                    findByProps("getCurrentUser");
-            }
-
-            const user =
-                userStore &&
-                userStore.getCurrentUser &&
-                userStore.getCurrentUser();
-
-            return user && user.id != null
-                ? String(user.id)
-                : null;
-
-        } catch (_) {
-            return null;
-        }
-    }
-
-    // ========================================
-    // 关键词正则
-    // ========================================
-
-    function escapeRegex(s) {
-        return s.replace(
-            /[.*+?^${}()|[\]\\]/g,
-            "\\$&"
-        );
-    }
-
-    let signature = "";
-    let regex = null;
-
-    function currentRegex() {
-        if (!storage.enabled) return null;
-
-        const words = (
-            Array.isArray(storage.list)
-                ? storage.list
-                : []
-        )
-            .filter(
-                i =>
-                    i &&
-                    i.enabled &&
-                    typeof i.word === "string" &&
-                    i.word
-            )
-            .map(i => i.word)
+    function getRegex() {
+        const words = (store.list || [])
+            .filter(x => x && x.enabled && x.word)
+            .map(x => x.word)
             .sort((a, b) => b.length - a.length);
 
-        const key = JSON.stringify(words);
+        const signature = JSON.stringify(words);
 
-        if (key !== signature) {
-            signature = key;
+        if (signature !== cachedSignature) {
+            cachedSignature = signature;
 
-            regex = words.length
+            cachedRegex = words.length
                 ? new RegExp(
-                    words.map(escapeRegex).join("|"),
+                    words
+                        .map(w =>
+                            w.replace(
+                                /[.*+?^${}()|[\]\\]/g,
+                                "\\$&"
+                            )
+                        )
+                        .join("|"),
                     "gi"
                 )
                 : null;
         }
 
-        return regex;
+        return cachedRegex;
     }
 
-    // ========================================
-    // 核心遮罩逻辑
-    // ========================================
+    // ---------- 消息遮罩 ----------
 
     function mask(text) {
-        if (typeof text !== "string" || !text) {
+        if (
+            !store.enabled ||
+            typeof text !== "string" ||
+            !text
+        ) {
             return text;
         }
 
-        const re = currentRegex();
+        const regex = getRegex();
 
-        if (!re) return text;
+        if (!regex) return text;
 
-        // 保留已经存在的剧透块
-        const spoiler = /\|\|[\s\S]*?\|\|/g;
+        // 已有剧透块不重复处理
+        const pieces = text.split(
+            /(\|\|[\s\S]*?\|\|)/g
+        );
 
-        let cursor = 0;
-        let result = "";
-        let m;
-
-        while ((m = spoiler.exec(text)) !== null) {
-            result += text
-                .slice(cursor, m.index)
-                .replace(
-                    re,
-                    x => "||" + x + "||"
-                );
-
-            result += m[0];
-
-            cursor = spoiler.lastIndex;
-        }
-
-        result += text
-            .slice(cursor)
-            .replace(
-                re,
-                x => "||" + x + "||"
-            );
-
-        return result;
-    }
-
-    // ========================================
-    // 扫描已经加载的历史消息
-    // ========================================
-
-    function scanLoadedMessages() {
-        const selected =
-            findByStoreName("SelectedChannelStore");
-
-        const messages =
-            findByStoreName("MessageStore");
-
-        const channelId =
-            selected &&
-            selected.getChannelId &&
-            selected.getChannelId();
-
-        if (
-            !channelId ||
-            !messages ||
-            typeof messages.getMessages !== "function"
-        ) {
-            return {
-                error:
-                    "无法读取当前频道，请先进入聊天再打开设置"
-            };
-        }
-
-        const collection =
-            messages.getMessages(channelId);
-
-        const items = Array.isArray(collection)
-            ? collection
-            : (
-                collection &&
-                Array.isArray(collection._array)
-                    ? collection._array
-                    : (
-                        collection &&
-                        typeof collection.toArray === "function"
-                            ? collection.toArray()
-                            : []
-                    )
-            );
-
-        // 只扫描最多500条已加载消息
-        const safeItems = Array.isArray(items)
-            ? items.slice(-500)
-            : [];
-
-        const counts = Object.create(null);
-
-        const words = (
-            Array.isArray(storage.list)
-                ? storage.list
-                : []
-        )
-            .filter(
-                i =>
-                    i &&
-                    typeof i.word === "string"
-            )
-            .map(i => ({
-                key: i.word.toLowerCase(),
-                word: i.word.toLowerCase()
-            }));
-
-        for (const { key } of words) {
-            counts[key] = 0;
-        }
-
-        let scanned = 0;
-
-        for (const message of safeItems) {
-            if (
-                !message ||
-                typeof message.content !== "string"
-            ) {
-                continue;
-            }
-
-            scanned++;
-
-            const content =
-                message.content.toLowerCase();
-
-            for (const { key, word } of words) {
-                if (content.includes(word)) {
-                    counts[key]++;
+        return pieces
+            .map(part => {
+                if (
+                    part.startsWith("||") &&
+                    part.endsWith("||")
+                ) {
+                    return part;
                 }
-            }
-        }
 
-        return {
-            channelId,
-            counts,
-            scanned,
-            matched:
-                Object.values(counts)
-                    .filter(n => n > 0)
-                    .length
-        };
+                return part.replace(
+                    regex,
+                    word => `||${word}||`
+                );
+            })
+            .join("");
     }
 
-    // ========================================
-    // 消息渲染 Hook
-    // ========================================
+    // ---------- 当前用户 ----------
 
-    let unpatch = null;
+    function myId() {
+        try {
+            const us = findByStoreName("UserStore");
 
-    exports.onLoad = () => {
-        if (unpatch) return;
+            const user =
+                us &&
+                us.getCurrentUser &&
+                us.getCurrentUser();
+
+            return user && user.id != null
+                ? String(user.id)
+                : null;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    // ---------- 手动启动遮罩 ----------
+
+    function start() {
+        if (active) {
+            return "遮罩已经启动";
+        }
 
         try {
-            const RowManager =
-                findByName("RowManager");
-
             if (
-                !RowManager ||
-                !RowManager.prototype ||
-                typeof RowManager.prototype.generate !== "function"
+                typeof before !== "function" ||
+                typeof findByName !== "function"
             ) {
-                console.warn(
-                    "[KeywordMask] RowManager.generate 不可用"
-                );
-                return;
+                return "当前客户端不支持此插件接口";
             }
 
-            unpatch = before(
+            const manager = findByName("RowManager");
+
+            if (
+                !manager ||
+                !manager.prototype ||
+                typeof manager.prototype.generate !== "function"
+            ) {
+                return "找不到 RowManager.generate，当前版本可能不兼容";
+            }
+
+            const cancel = before(
                 "generate",
-                RowManager.prototype,
-                (args) => {
+                manager.prototype,
+                args => {
                     try {
                         const row = args && args[0];
 
@@ -379,669 +224,597 @@
                         const msg = row.message;
 
                         if (
-                            typeof msg.content !== "string" ||
-                            !msg.content
+                            typeof msg.content !== "string"
                         ) {
                             return;
                         }
 
-                        const me = getMyId();
+                        const id = myId();
 
-                        // 是否跳过自己的消息
                         if (
-                            !storage.maskSelf &&
-                            me &&
+                            !store.maskSelf &&
+                            id &&
                             msg.author &&
-                            String(msg.author.id) === me
+                            String(msg.author.id) === id
                         ) {
                             return;
                         }
 
-                        const out = mask(msg.content);
+                        const next = mask(msg.content);
 
-                        if (out === msg.content) {
+                        if (next === msg.content) {
                             return;
                         }
 
-                        // 克隆消息对象，不改动原始消息
-                        const viewMsg = Object.assign(
+                        // 克隆消息，不修改原始对象
+                        const copyMessage = Object.assign(
                             Object.create(
                                 Object.getPrototypeOf(msg)
                             ),
                             msg,
-                            { content: out }
+                            { content: next }
                         );
 
-                        // 克隆聊天行
-                        const viewRow = Object.assign(
+                        // 克隆行对象
+                        args[0] = Object.assign(
                             Object.create(
                                 Object.getPrototypeOf(row)
                             ),
                             row,
-                            { message: viewMsg }
+                            { message: copyMessage }
                         );
-
-                        args[0] = viewRow;
 
                     } catch (e) {
                         console.warn(
-                            "[KeywordMask] 本条消息未遮罩",
+                            "[KeywordMask] 遮罩失败",
                             e
                         );
                     }
                 }
             );
 
+            if (typeof cancel !== "function") {
+                return "Hook 返回异常，未确认启动成功";
+            }
+
+            unpatch = cancel;
+            active = true;
+
+            return "遮罩已启动，切换频道后应用历史消息";
+
         } catch (e) {
-            console.warn(
-                "[KeywordMask] 加载失败",
-                e
-            );
+            return "启动失败：" +
+                String(e && e.message || e);
         }
-    };
+    }
 
-    // ========================================
-    // 卸载插件
-    // ========================================
+    // ---------- 停止遮罩 ----------
 
-    exports.onUnload = () => {
-        if (typeof unpatch === "function") {
-            try {
-                unpatch();
-            } catch (_) {}
-        }
+    function stop() {
+        try {
+            if (unpatch) unpatch();
+        } catch (_) {}
 
         unpatch = null;
+        active = false;
+
+        return "遮罩已停止，切换频道后恢复原始显示";
+    }
+
+    // ---------- 扫描历史消息 ----------
+
+    function scanLoaded() {
+        try {
+            const selected = findByStoreName(
+                "SelectedChannelStore"
+            );
+
+            const messages = findByStoreName(
+                "MessageStore"
+            );
+
+            const cid =
+                selected &&
+                selected.getChannelId &&
+                selected.getChannelId();
+
+            if (
+                !cid ||
+                !messages ||
+                typeof messages.getMessages !== "function"
+            ) {
+                return {
+                    error: "无法读取当前频道，请先打开聊天"
+                };
+            }
+
+            const coll = messages.getMessages(cid);
+
+            const arr = Array.isArray(coll)
+                ? coll
+                : coll && Array.isArray(coll._array)
+                    ? coll._array
+                    : coll &&
+                      typeof coll.toArray === "function"
+                        ? coll.toArray()
+                        : [];
+
+            const counts = {};
+
+            for (const item of store.list || []) {
+                counts[item.word.toLowerCase()] = 0;
+            }
+
+            let scanned = 0;
+
+            for (const m of arr.slice(-500)) {
+                if (
+                    !m ||
+                    typeof m.content !== "string"
+                ) {
+                    continue;
+                }
+
+                scanned++;
+
+                const content = m.content.toLowerCase();
+
+                for (const item of store.list || []) {
+                    const key = item.word.toLowerCase();
+
+                    if (content.includes(key)) {
+                        counts[key]++;
+                    }
+                }
+            }
+
+            return {
+                scanned,
+                counts
+            };
+
+        } catch (e) {
+            return {
+                error: "扫描失败，当前客户端可能不支持消息缓存接口"
+            };
+        }
+    }
+
+    // ---------- 插件生命周期 ----------
+
+    // 安装时不自动挂载 Hook
+    exports.onLoad = () => {};
+
+    exports.onUnload = stop;
+
+    // ---------- 设置界面样式 ----------
+
+    const styles = {
+        title: {
+            color: "#FFFFFF",
+            fontSize: 17,
+            fontWeight: "700",
+            marginBottom: 10
+        },
+
+        text: {
+            color: "#E7E7ED",
+            fontSize: 14
+        },
+
+        hint: {
+            color: "#B8BAC6",
+            fontSize: 12,
+            marginTop: 6
+        },
+
+        input: {
+            color: "#FFFFFF",
+            backgroundColor: "#30323C",
+            borderRadius: 9,
+            paddingHorizontal: 12,
+            paddingVertical: 10,
+            marginVertical: 8
+        },
+
+        section: {
+            padding: 16,
+            borderBottomWidth: 1,
+            borderBottomColor: "#42444E"
+        },
+
+        button: {
+            backgroundColor: "#5865F2",
+            paddingHorizontal: 13,
+            paddingVertical: 10,
+            borderRadius: 9,
+            alignItems: "center",
+            marginVertical: 4
+        },
+
+        row: {
+            flexDirection: "row",
+            alignItems: "center",
+            justifyContent: "space-between",
+            marginVertical: 7
+        }
     };
 
-    // ========================================
-    // 按钮组件
-    // ========================================
+    // ---------- 按钮 ----------
 
-    function Btn({
-        text,
-        kind = "primary",
-        onPress,
-        small,
-        style
-    }) {
-        const bg = {
-            primary: "#5865F2",
-            secondary: "#50545E",
-            danger: "#D83C3E"
-        }[kind];
-
+    function Button({ label, onPress, danger }) {
         return h(
             TouchableOpacity,
             {
                 onPress,
-                activeOpacity: 0.8,
-                style: Object.assign(
-                    {
-                        backgroundColor: bg,
-                        borderRadius: 9,
-                        paddingVertical: small ? 8 : 12,
-                        paddingHorizontal: small ? 10 : 14,
-                        alignItems: "center",
-                        justifyContent: "center"
-                    },
-                    style || {}
-                )
+                activeOpacity: 0.75,
+                style: [
+                    styles.button,
+                    danger
+                        ? { backgroundColor: "#B83B43" }
+                        : null
+                ]
             },
+
             h(
                 Text,
                 {
                     style: {
                         color: "#FFFFFF",
-                        fontSize: small ? 13 : 15,
                         fontWeight: "600"
                     }
                 },
-                text
+                label
             )
         );
     }
 
-    // ========================================
-    // 输入框组件
-    // ========================================
+    // ---------- 设置页面 ----------
 
-    function Field({
-        label,
-        value,
-        onChangeText,
-        placeholder
-    }) {
-        return h(
-            View,
-            {
-                style: {
-                    paddingHorizontal: 16,
-                    paddingTop: 10,
-                    paddingBottom: 8
-                }
-            },
-            h(
-                Text,
-                {
-                    style: {
-                        fontSize: 13,
-                        color: "#B5BAC1",
-                        marginBottom: 8
-                    }
-                },
-                label
-            ),
-            h(TextInput, {
-                value,
-                onChangeText,
-                placeholder,
-                placeholderTextColor: "#A4A6AE",
-                autoCapitalize: "none",
-                autoCorrect: false,
-                style: {
-                    borderRadius: 9,
-                    paddingHorizontal: 12,
-                    paddingVertical: 10,
-                    color: "#FFFFFF",
-                    backgroundColor: "#303238",
-                    fontSize: 15,
-                    borderWidth: 1,
-                    borderColor: "#4D5059"
-                }
-            })
-        );
-    }
+    exports.settings = function Settings() {
+        const [draft, setDraft] = React.useState("");
+        const [query, setQuery] = React.useState("");
+        const [result, setResult] = React.useState(null);
 
-    // ========================================
-    // 插件设置页面
-    // ========================================
-
-    exports.settings = () => {
-        useProxy(storage);
-
-        const [draft, setDraft] =
-            React.useState("");
-
-        const [query, setQuery] =
-            React.useState("");
-
-        const [scan, setScan] =
-            React.useState(null);
-
-        const list =
-            Array.isArray(storage.list)
-                ? storage.list
-                : [];
-
-        const q =
-            query.trim().toLowerCase();
-
-        const shown = list.filter(
-            i => i.word.toLowerCase().includes(q)
+        const [notice, setNotice] = React.useState(
+            "安装时不会启动遮罩，请在此手动启动。"
         );
 
-        const matched =
-            scan && !scan.error
-                ? list.filter(
-                    i =>
-                        (
-                            scan.counts[
-                                i.word.toLowerCase()
-                            ] || 0
-                        ) > 0
-                )
-                : [];
+        const [, refresh] = React.useState(0);
 
-        // 修改单个关键词状态
-        function updateWord(word, enabled) {
-            storage.list = (
-                storage.list || []
-            ).map(
-                i =>
-                    i.word === word
-                        ? {
-                            word: i.word,
-                            enabled
-                        }
-                        : i
-            );
-        }
+        const update = () => refresh(x => x + 1);
 
-        // 批量修改关键词状态
-        function updateBatch(items, enabled) {
+        const list = Array.isArray(store.list)
+            ? store.list
+            : [];
+
+        const shown = list.filter(x =>
+            x.word
+                .toLowerCase()
+                .includes(query.trim().toLowerCase())
+        );
+
+        // 修改关键词
+        function setWords(items, enabled) {
             const names = new Set(
-                items.map(
-                    i => i.word.toLowerCase()
-                )
+                items.map(x => x.word.toLowerCase())
             );
 
-            storage.list = (
-                storage.list || []
-            ).map(
-                i =>
-                    names.has(
-                        i.word.toLowerCase()
-                    )
-                        ? {
-                            word: i.word,
-                            enabled
-                        }
-                        : i
+            store.list = list.map(x =>
+                names.has(x.word.toLowerCase())
+                    ? { ...x, enabled }
+                    : x
             );
 
-            toast(
-                "已修改 " +
-                names.size +
-                " 个关键词"
+            setNotice(
+                `已${enabled ? "启用" : "停用"} ` +
+                `${names.size} 个关键词，切换频道后应用`
             );
+
+            update();
         }
 
         // 添加关键词
-        function add() {
-            const word = draft.trim();
-
-            if (!word) {
-                return toast("先输入关键词");
-            }
+        function addWord() {
+            const w = draft.trim();
 
             if (
-                word.length > 100 ||
-                word.includes("||")
+                !w ||
+                w.length > 100 ||
+                w.includes("||")
             ) {
-                return toast(
-                    "关键词长度不能超过100，且不能包含 ||"
+                setNotice(
+                    "请输入1至100字且不包含 || 的关键词"
                 );
+                return;
             }
 
             if (
                 list.some(
-                    i =>
-                        i.word.toLowerCase() ===
-                        word.toLowerCase()
+                    x =>
+                        x.word.toLowerCase() ===
+                        w.toLowerCase()
                 )
             ) {
-                return toast(
-                    "关键词已存在，可在列表里启用"
-                );
+                setNotice("关键词已经存在");
+                return;
             }
 
-            storage.list = [
+            store.list = [
                 {
-                    word,
+                    word: w,
                     enabled: true
                 },
                 ...list
             ];
 
             setDraft("");
-            setScan(null);
+            setResult(null);
 
-            toast("添加成功");
-        }
-
-        // 删除关键词
-        function remove(word) {
-            Alert.alert(
-                "删除关键词",
-                "删除「" + word + "」？",
-                [
-                    {
-                        text: "取消",
-                        style: "cancel"
-                    },
-                    {
-                        text: "删除",
-                        style: "destructive",
-                        onPress: () => {
-                            storage.list = (
-                                storage.list || []
-                            ).filter(
-                                i => i.word !== word
-                            );
-
-                            setScan(null);
-                        }
-                    }
-                ]
+            setNotice(
+                "关键词已添加，切换频道后应用"
             );
+
+            update();
         }
 
-        // 扫描当前频道
-        function runScan() {
-            try {
-                const result =
-                    scanLoadedMessages();
+        // 删除关键词：不弹确认框
+        function removeWord(word) {
+            store.list = list.filter(
+                x => x.word !== word
+            );
 
-                setScan(result);
+            setResult(null);
 
-                if (result.error) {
-                    toast(result.error);
-                } else {
-                    toast(
-                        "扫描完成：" +
-                        result.matched +
-                        " 个关键词出现在已加载消息中"
-                    );
-                }
+            setNotice(
+                `已删除「${word}」，切换频道后应用`
+            );
 
-            } catch (e) {
-                setScan({
-                    error:
-                        "扫描失败：当前版本可能不支持读取消息缓存"
-                });
-            }
+            update();
         }
 
-        // ====================================
-        // 设置页面布局
-        // ====================================
+        // ---------- UI 辅助 ----------
+
+        const section = (...children) =>
+            h(
+                View,
+                { style: styles.section },
+                ...children
+            );
+
+        const heading = text =>
+            h(
+                Text,
+                { style: styles.title },
+                text
+            );
+
+        const hint = text =>
+            h(
+                Text,
+                { style: styles.hint },
+                text
+            );
+
+        const input = (
+            value,
+            setter,
+            placeholder
+        ) =>
+            h(TextInput, {
+                value,
+                onChangeText: setter,
+                placeholder,
+                placeholderTextColor: "#9295A2",
+                style: styles.input,
+                autoCapitalize: "none",
+                autoCorrect: false
+            });
+
+        const sw = (
+            label,
+            value,
+            change
+        ) =>
+            h(
+                View,
+                { style: styles.row },
+
+                h(
+                    Text,
+                    {
+                        style: [
+                            styles.text,
+                            { flex: 1 }
+                        ]
+                    },
+                    label
+                ),
+
+                h(Switch, {
+                    value,
+                    onValueChange: change
+                })
+            );
+
+        // ---------- 主设置页面 ----------
 
         return h(
             ScrollView,
             {
-                style: { flex: 1 },
+                style: {
+                    flex: 1,
+                    backgroundColor: "#23242C"
+                },
                 keyboardShouldPersistTaps: "handled"
             },
 
-            // 总开关
-            h(
-                FormSection,
-                {
-                    title: "关键词遮罩"
-                },
+            // 遮罩控制
+            section(
+                heading("关键词遮罩"),
 
-                h(FormRow, {
-                    label: "启用遮罩",
-                    trailing: h(FormSwitch, {
-                        value: storage.enabled,
-                        onValueChange: v => {
-                            storage.enabled = v;
-                        }
-                    })
+                hint(notice),
+
+                h(Button, {
+                    label: active
+                        ? "停止遮罩"
+                        : "启动遮罩",
+
+                    onPress: () => {
+                        setNotice(
+                            active ? stop() : start()
+                        );
+                        update();
+                    }
                 }),
 
-                h(FormRow, {
-                    label: "也遮罩自己发的消息",
-                    trailing: h(FormSwitch, {
-                        value: storage.maskSelf,
-                        onValueChange: v => {
-                            storage.maskSelf = v;
-                        }
-                    })
-                }),
+                sw(
+                    "启用关键词规则",
+                    store.enabled,
+                    v => {
+                        store.enabled = v;
+                        update();
+                    }
+                ),
 
-                h(
-                    FormText,
-                    {
-                        style: {
-                            paddingHorizontal: 16,
-                            paddingBottom: 10
-                        }
-                    },
-                    "只改变本地显示，不修改服务器消息。" +
-                    "设置更改后切换一次频道，" +
-                    "让已加载的旧消息重新渲染。"
+                sw(
+                    "也遮罩自己发送的消息",
+                    store.maskSelf,
+                    v => {
+                        store.maskSelf = v;
+                        update();
+                    }
+                ),
+
+                hint(
+                    "仅改变本地显示。" +
+                    "切换频道后，重新加载的历史消息也会应用遮罩。"
                 )
             ),
 
             // 添加关键词
-            h(
-                FormSection,
-                {
-                    title: "添加新关键词"
-                },
+            section(
+                heading("添加关键词"),
 
-                h(Field, {
-                    label: "关键词",
-                    value: draft,
-                    onChangeText: setDraft,
-                    placeholder: "输入要遮盖的词"
-                }),
+                input(
+                    draft,
+                    setDraft,
+                    "输入关键词"
+                ),
 
-                h(
-                    View,
-                    {
-                        style: {
-                            paddingHorizontal: 16,
-                            paddingBottom: 12
-                        }
-                    },
-                    h(Btn, {
-                        text: "添加并启用",
-                        onPress: add
-                    })
-                )
+                h(Button, {
+                    label: "添加",
+                    onPress: addWord
+                })
             ),
 
-            // 历史消息扫描
-            h(
-                FormSection,
-                {
-                    title: "在旧聊天中选择关键词"
-                },
+            // 历史扫描
+            section(
+                heading("历史聊天扫描"),
 
-                h(
-                    FormText,
-                    {
-                        style: {
-                            paddingHorizontal: 16,
-                            paddingVertical: 8
-                        }
-                    },
-                    "扫描当前频道已加载的消息，" +
-                    "查找已保存关键词出现了多少次。" +
-                    "只扫描本地缓存，不拉取全部聊天记录。"
+                hint(
+                    "扫描当前频道已加载的最多500条消息。" +
+                    "只查找已经保存的关键词，不自动提取新词。"
                 ),
 
-                h(
-                    View,
-                    {
-                        style: {
-                            paddingHorizontal: 16,
-                            paddingBottom: 8
-                        }
-                    },
-                    h(Btn, {
-                        text: "扫描当前频道",
-                        kind: "secondary",
-                        onPress: runScan
+                h(Button, {
+                    label: "扫描当前频道",
+
+                    onPress: () => {
+                        const r = scanLoaded();
+
+                        setResult(r);
+
+                        setNotice(
+                            r.error ||
+                            `已扫描 ${r.scanned} 条消息`
+                        );
+                    }
+                }),
+
+                result && !result.error
+                    ? h(Button, {
+                        label: "启用历史消息命中的关键词",
+
+                        onPress: () =>
+                            setWords(
+                                list.filter(
+                                    x =>
+                                        (
+                                            result.counts[
+                                                x.word.toLowerCase()
+                                            ] || 0
+                                        ) > 0
+                                ),
+                                true
+                            )
                     })
-                ),
-
-                scan
-                    ? h(
-                        FormText,
-                        {
-                            style: {
-                                paddingHorizontal: 16,
-                                paddingBottom: 8
-                            }
-                        },
-                        scan.error ||
-                        (
-                            "已扫描 " +
-                            scan.scanned +
-                            " 条消息，命中 " +
-                            scan.matched +
-                            " 个关键词。"
-                        )
-                    )
-                    : null,
-
-                matched.length
-                    ? h(
-                        View,
-                        {
-                            style: {
-                                flexDirection: "row",
-                                paddingHorizontal: 16,
-                                paddingBottom: 12
-                            }
-                        },
-
-                        h(Btn, {
-                            text:
-                                "启用命中词（" +
-                                matched.length +
-                                "）",
-                            small: true,
-                            style: {
-                                flex: 1,
-                                marginRight: 8
-                            },
-                            onPress: () =>
-                                updateBatch(
-                                    matched,
-                                    true
-                                )
-                        }),
-
-                        h(Btn, {
-                            text: "停用命中词",
-                            small: true,
-                            kind: "secondary",
-                            style: {
-                                flex: 1
-                            },
-                            onPress: () =>
-                                updateBatch(
-                                    matched,
-                                    false
-                                )
-                        })
-                    )
                     : null
             ),
 
-            // 已保存关键词
-            h(
-                FormSection,
-                {
-                    title:
-                        "已保存关键词（" +
-                        list.filter(i => i.enabled).length +
-                        "/" +
-                        list.length +
-                        " 已启用）"
-                },
-
-                h(Field, {
-                    label: "搜索已有关键词",
-                    value: query,
-                    onChangeText: setQuery,
-                    placeholder: "筛选关键词"
-                }),
-
-                h(
-                    View,
-                    {
-                        style: {
-                            flexDirection: "row",
-                            paddingHorizontal: 16,
-                            paddingVertical: 8
-                        }
-                    },
-
-                    h(Btn, {
-                        text: "启用筛选结果",
-                        small: true,
-                        style: {
-                            flex: 1,
-                            marginRight: 8
-                        },
-                        onPress: () =>
-                            updateBatch(
-                                shown,
-                                true
-                            )
-                    }),
-
-                    h(Btn, {
-                        text: "停用筛选结果",
-                        small: true,
-                        kind: "secondary",
-                        style: {
-                            flex: 1
-                        },
-                        onPress: () =>
-                            updateBatch(
-                                shown,
-                                false
-                            )
-                    })
+            // 关键词管理
+            section(
+                heading(
+                    `关键词列表（${
+                        list.filter(x => x.enabled).length
+                    }/${list.length} 已启用）`
                 ),
 
-                shown.length
-                    ? shown.map(item => {
-                        const count =
-                            scan &&
-                            !scan.error &&
-                            scan.counts[
-                                item.word.toLowerCase()
-                            ];
+                input(
+                    query,
+                    setQuery,
+                    "搜索已有关键词"
+                ),
 
-                        const suffix =
-                            typeof count === "number"
-                                ? " · 本频道 " +
-                                  count +
-                                  " 条"
-                                : "";
+                h(Button, {
+                    label: "启用筛选结果",
+                    onPress: () =>
+                        setWords(shown, true)
+                }),
 
-                        return h(FormRow, {
-                            key: item.word,
-                            label: item.word,
+                h(Button, {
+                    label: "停用筛选结果",
+                    onPress: () =>
+                        setWords(shown, false)
+                }),
 
-                            subLabel:
-                                (
-                                    item.enabled
-                                        ? "遮罩开启"
-                                        : "遮罩关闭"
-                                ) + suffix,
-
-                            trailing: h(
-                                View,
-                                {
-                                    style: {
-                                        flexDirection: "row",
-                                        alignItems: "center"
-                                    }
-                                },
-
-                                h(Btn, {
-                                    text: "删除",
-                                    kind: "danger",
-                                    small: true,
-                                    style: {
-                                        marginRight: 10
-                                    },
-                                    onPress: () =>
-                                        remove(item.word)
-                                }),
-
-                                h(FormSwitch, {
-                                    value: item.enabled,
-                                    onValueChange: v =>
-                                        updateWord(
-                                            item.word,
-                                            v
-                                        )
-                                })
-                            )
-                        });
-                    })
-                    : h(
-                        FormText,
+                ...shown.map(x =>
+                    h(
+                        View,
                         {
+                            key: x.word,
                             style: {
-                                paddingHorizontal: 16,
-                                paddingVertical: 12
+                                paddingVertical: 9,
+                                borderBottomWidth: 1,
+                                borderBottomColor: "#3B3D46"
                             }
                         },
-                        q
-                            ? "没有匹配的关键词"
-                            : "还没有保存关键词"
+
+                        sw(
+                            x.word,
+                            x.enabled,
+                            value =>
+                                setWords([x], value)
+                        ),
+
+                        hint(
+                            result && !result.error
+                                ? `已加载消息中命中 ${
+                                    result.counts[
+                                        x.word.toLowerCase()
+                                    ] || 0
+                                } 条`
+                                : ""
+                        ),
+
+                        h(Button, {
+                            label: "删除此词",
+                            danger: true,
+                            onPress: () =>
+                                removeWord(x.word)
+                        })
                     )
+                )
             )
         );
     };
